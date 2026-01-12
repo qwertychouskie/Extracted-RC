@@ -50,6 +50,7 @@ import org.firstinspires.ftc.robotcore.internal.network.RobotCoreCommandList.Tex
 
 import java.text.DecimalFormat;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -631,8 +632,10 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
     protected final Object theLock = new Object();
     protected LineableContainer   lines;
+    protected ArrayList<Lineable> linesCopyBuffer = new ArrayList<>(); // When telemetry.update() is called, we copy the contents of `lines` in the hot path so we can punt the heavy processing off to a thread and return as quick as possible
     protected List<String>        composedLines;
     protected List<Runnable>      actions;
+    protected TelemetryMessage    transmitter = new TelemetryMessage(); // Build an object to cary our telemetry data
     protected LogImpl             log;
     protected ElapsedTime         transmissionTimer;
     protected boolean             isDirty;
@@ -719,6 +722,23 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
     protected enum UpdateReason { USER, LOG, IFDIRTY }
 
+    private final ConcurrentLinkedQueue<Runnable> taskQueue = new ConcurrentLinkedQueue<>();
+        {
+        Thread worker = new Thread(() ->
+            {
+            while (true)
+                {
+                Runnable task = taskQueue.poll();
+                if (task != null)
+                    task.run();
+                else
+                    Thread.yield();
+                }
+            });
+        worker.setDaemon(true);
+        worker.start();
+        }
+
     protected boolean tryUpdate(UpdateReason updateReason)
         {
         synchronized (theLock)
@@ -742,15 +762,26 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
                     action.run();
                     }
 
-                // Build an object to cary our telemetry data
-                TelemetryMessage transmitter = new TelemetryMessage();
-                this.saveToTransmitter(recompose, transmitter);
+                // Reset the object that carries our telemetry data
+                transmitter.clearData();
 
-                // Transmit if there's anything to transmit
-                if (transmitter.hasData())
+                // Copy Lineable references to an ArrayList so we can process them in the thread
+                linesCopyBuffer.clear();
+                for (Lineable lineable : lines)
                     {
-                    OpModeManagerImpl.updateTelemetryNow(this.opMode, transmitter);
+                    linesCopyBuffer.add(lineable);
                     }
+
+                taskQueue.offer(() ->
+                    {
+                    this.saveToTransmitter(recompose, transmitter, linesCopyBuffer); // Slow!
+
+                    // Transmit if there's anything to transmit
+                    if (transmitter.hasData())
+                        {
+                        OpModeManagerImpl.updateTelemetryNow(this.opMode, transmitter); // Slow!
+                        }
+                    });
 
                 // We've definitely got nothing lingering to transmit
                 this.log.markClean();
@@ -780,7 +811,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
             }
         }
 
-    protected void saveToTransmitter(boolean recompose, TelemetryMessage transmitter)
+    protected void saveToTransmitter(boolean recompose, TelemetryMessage transmitter, ArrayList<Lineable> lines)
         {
         transmitter.setSorted(false);
 
@@ -791,7 +822,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
         if (recompose)
             {
             this.composedLines = new ArrayList<String>();
-            for (Lineable lineable : this.lines)
+            for (Lineable lineable : lines) // Uses the passed-in `lines` so the main `lines` can be cleared/modified while this does its thing in a thread
                 {
                 this.composedLines.add(lineable.getComposed(recompose));
                 }
