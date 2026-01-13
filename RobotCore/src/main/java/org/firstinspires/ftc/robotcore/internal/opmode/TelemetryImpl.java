@@ -50,7 +50,8 @@ import org.firstinspires.ftc.robotcore.internal.network.RobotCoreCommandList.Tex
 
 import java.text.DecimalFormat;
 import java.util.ArrayList;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -723,17 +724,22 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
     protected enum UpdateReason { USER, LOG, IFDIRTY }
 
-    private final ConcurrentLinkedQueue<Runnable> taskQueue = new ConcurrentLinkedQueue<>();
+    private final BlockingQueue<Runnable> taskQueue = new LinkedBlockingQueue<>();
         {
         Thread worker = new Thread(null, () ->
             {
             while (true)
                 {
-                Runnable task = taskQueue.poll();
-                if (task != null)
+                try
+                    {
+                    Runnable task = taskQueue.take();
                     task.run();
-                else
-                    Thread.yield();
+                    }
+                catch (InterruptedException e)
+                    {
+                    Thread.currentThread().interrupt();
+                    break;
+                    }
                 }
             }, "TelemetryImplUpdateWorkerThread");
         worker.setDaemon(true);
