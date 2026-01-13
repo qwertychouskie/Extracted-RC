@@ -631,6 +631,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
     //----------------------------------------------------------------------------------------------
 
     protected final Object theLock = new Object();
+    protected final Object updateLock = new Object();
     protected LineableContainer   lines;
     protected ArrayList<Lineable> linesCopyBuffer = new ArrayList<>(); // When telemetry.update() is called, we copy the contents of `lines` in the hot path so we can punt the heavy processing off to a thread and return as quick as possible
     protected List<String>        composedLines;
@@ -724,7 +725,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
     private final ConcurrentLinkedQueue<Runnable> taskQueue = new ConcurrentLinkedQueue<>();
         {
-        Thread worker = new Thread(() ->
+        Thread worker = new Thread(null, () ->
             {
             while (true)
                 {
@@ -734,14 +735,15 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
                 else
                     Thread.yield();
                 }
-            });
+            }, "TelemetryImplUpdateWorkerThread");
         worker.setDaemon(true);
         worker.start();
         }
 
     protected boolean tryUpdate(UpdateReason updateReason)
         {
-        synchronized (theLock)
+        // Wait for any in-progress worker task to complete before we run this again to avoid clobbering in-use stuff
+        synchronized (updateLock) { synchronized (theLock)
             {
             boolean result = false;
 
@@ -774,12 +776,15 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
                 taskQueue.offer(() ->
                     {
-                    this.saveToTransmitter(recompose, transmitter, linesCopyBuffer); // Slow!
-
-                    // Transmit if there's anything to transmit
-                    if (transmitter.hasData())
+                    synchronized (updateLock)
                         {
-                        OpModeManagerImpl.updateTelemetryNow(this.opMode, transmitter); // Slow!
+                        this.saveToTransmitter(recompose, transmitter, linesCopyBuffer); // Slow!
+
+                        // Transmit if there's anything to transmit
+                        if (transmitter.hasData())
+                            {
+                            OpModeManagerImpl.updateTelemetryNow(this.opMode, transmitter); // Slow!
+                            }
                         }
                     });
 
@@ -809,7 +814,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
 
             return result;
             }
-        }
+        }}
 
     protected void saveToTransmitter(boolean recompose, TelemetryMessage transmitter, ArrayList<Lineable> lines)
         {
@@ -821,7 +826,7 @@ public class TelemetryImpl implements Telemetry, TelemetryInternal
         // a subsequent user update().
         if (recompose)
             {
-            this.composedLines = new ArrayList<String>();
+            this.composedLines.clear();
             for (Lineable lineable : lines) // Uses the passed-in `lines` so the main `lines` can be cleared/modified while this does its thing in a thread
                 {
                 this.composedLines.add(lineable.getComposed(recompose));
